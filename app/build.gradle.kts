@@ -1044,11 +1044,25 @@ dependencies {
     "hms_workImplementation"(group = "", name = "agconnect-core-1.9.1.301", ext = "aar")
 }
 
+private fun findExecutable(name: String): String {
+    val candidates = listOf(
+        "/opt/homebrew/opt/rustup/bin/$name",
+        "${System.getProperty("user.home")}/.cargo/bin/$name",
+        "/opt/homebrew/bin/$name",
+        "/usr/local/bin/$name",
+        "/usr/bin/$name"
+    )
+    return candidates.firstOrNull { file(it).exists() } ?: name
+}
+
 // Define the cargo attributes. These will be used by the rust-android plugin that will create the
 // 'cargoBuild' task that builds native libraries that will be added to the apk. Note that the
 // kotlin bindings are created in the domain module. Building native libraries with rust-android
 // cannot be done in any other module than 'app'.
 cargo {
+    cargoCommand = findExecutable("cargo")
+    rustcCommand = findExecutable("rustc")
+    apiLevel = 21
     prebuiltToolchains = true
     targetDirectory = "$projectDir/build/generated/source/libthreema"
     module = "$projectDir/../domain/libthreema" // must contain Cargo.toml
@@ -1059,16 +1073,77 @@ cargo {
     features {
         defaultAnd(arrayOf("uniffi"))
     }
-    extraCargoBuildArguments = listOf("--lib", "--target-dir", "$projectDir/build/generated/source/libthreema", "--locked")
-    verbose = false
+    extraCargoBuildArguments = listOf("-p", "libthreema", "--lib", "--locked")
+    verbose = true
 }
 
 afterEvaluate {
+    val ndkBinPath = file("${android.ndkDirectory}/toolchains/llvm/prebuilt/darwin-x86_64/bin").takeIf { it.exists() }?.absolutePath
+        ?: file("${android.ndkDirectory}/toolchains/llvm/prebuilt/darwin-aarch64/bin").takeIf { it.exists() }?.absolutePath
+        ?: ""
+    val extraPath = listOfNotNull(
+        "/opt/homebrew/opt/rustup/bin",
+        "${System.getProperty("user.home")}/.cargo/bin",
+        ndkBinPath.ifEmpty { null },
+        "/opt/homebrew/bin",
+        "/usr/local/bin"
+    ).joinToString(":") + ":" + (System.getenv("PATH") ?: "")
+
+    val targetMap = mapOf(
+        "cargoBuildArm64" to Triple("aarch64-linux-android", "aarch64-linux-android21-clang", "arm64-v8a"),
+        "cargoBuildArm" to Triple("armv7-linux-androideabi", "armv7a-linux-androideabi21-clang", "armeabi-v7a"),
+        "cargoBuildX86" to Triple("i686-linux-android", "i686-linux-android21-clang", "x86"),
+        "cargoBuildX86_64" to Triple("x86_64-linux-android", "x86_64-linux-android21-clang", "x86_64")
+    )
+
+    targetMap.forEach { (taskName, targetInfo) ->
+        val (rustTarget, clangName, abiDir) = targetInfo
+        val targetEnvKey = rustTarget.uppercase().replace("-", "_")
+        val task = tasks.findByName(taskName)
+        if (task != null) {
+            task.actions.clear()
+            task.doLast {
+                val cargoBin = findExecutable("cargo")
+                val pb = ProcessBuilder(
+                    cargoBin, "build",
+                    "--target", rustTarget,
+                    "--release",
+                    "-F", "uniffi",
+                    "-p", "libthreema",
+                    "--locked"
+                )
+                pb.directory(file("$projectDir/../domain/libthreema"))
+                pb.environment()["PATH"] = extraPath
+                pb.environment()["ANDROID_NDK_HOME"] = android.ndkDirectory.absolutePath
+                pb.environment()["NDK_HOME"] = android.ndkDirectory.absolutePath
+                if (ndkBinPath.isNotEmpty()) {
+                    pb.environment()["CARGO_TARGET_${targetEnvKey}_LINKER"] = "$ndkBinPath/$clangName"
+                    pb.environment()["CC_${rustTarget.replace("-", "_")}"] = "$ndkBinPath/$clangName"
+                    pb.environment()["AR_${rustTarget.replace("-", "_")}"] = "$ndkBinPath/llvm-ar"
+                }
+                val process = pb.inheritIO().start()
+                val exitCode = process.waitFor()
+                if (exitCode != 0) {
+                    throw GradleException("cargo build for $rustTarget failed with exit code $exitCode")
+                }
+
+                // Copy generated liblibthreema.so to libs directory
+                val srcSo = file("$projectDir/../domain/libthreema/target/$rustTarget/release/liblibthreema.so")
+                val destDir = file("$projectDir/libs/$abiDir")
+                destDir.mkdirs()
+                srcSo.copyTo(file("$destDir/liblibthreema.so"), overwrite = true)
+            }
+        }
+    }
+
     // The `cargoBuild` task isn't available until after evaluation.
-    android.applicationVariants.configureEach {
-        val variantName = name.replaceFirstChar { it.uppercase() }
-        // Set the dependency so that cargoBuild is executed before the native libs are merged
-        tasks["merge${variantName}NativeLibs"].dependsOn(tasks["cargoBuild"])
+    val cargoBuildTask = tasks.findByName("cargoBuild")
+    if (cargoBuildTask != null) {
+        android.applicationVariants.configureEach {
+            val variantName = name.replaceFirstChar { it.uppercase() }
+            // Set the dependency so that cargoBuild is executed before the native libs are merged
+            tasks.findByName("merge${variantName}NativeLibs")?.dependsOn(cargoBuildTask)
+        }
     }
 }
 
@@ -1108,6 +1183,7 @@ androidStem {
 tasks.register<Exec>("compileProto") {
     group = "build"
     description = "generate class bindings from protobuf files in the 'protobuf' directory"
+    environment("PATH", "/opt/homebrew/bin:/usr/local/bin:${System.getProperty("user.home")}/.cargo/bin:" + (System.getenv("PATH") ?: ""))
     workingDir(project.projectDir)
     commandLine("./compile-proto.sh")
 }

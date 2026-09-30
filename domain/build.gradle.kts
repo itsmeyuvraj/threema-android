@@ -78,13 +78,27 @@ sonarqube {
     }
 }
 
+fun findExecutable(name: String): String {
+    val candidates = listOf(
+        "/opt/homebrew/opt/rustup/bin/$name",
+        "${System.getProperty("user.home")}/.cargo/bin/$name",
+        "/opt/homebrew/bin/$name",
+        "/usr/local/bin/$name",
+        "/usr/bin/$name"
+    )
+    return candidates.firstOrNull { file(it).exists() } ?: name
+}
+
 afterEvaluate {
     val bindingsDirectory = "../build/generated/source/libthreema"
+    val extraPath = "/opt/homebrew/bin:/usr/local/bin:${System.getProperty("user.home")}/.cargo/bin:" + (System.getenv("PATH") ?: "")
+    val cargoBin = findExecutable("cargo")
 
     // Define the task to generate libthreema library (only used to generate bindings for it)
     val generateLibthreema = tasks.register<Exec>("generateLibthreema") {
+        environment("PATH", extraPath)
         workingDir("${project.projectDir}/libthreema")
-        commandLine("cargo", "build", "-F", "uniffi", "-p", "libthreema", "--release", "--locked")
+        commandLine(cargoBin, "build", "-F", "uniffi", "-p", "libthreema", "--release", "--locked")
     }
 
     // Define the task to generate the uniffi bindings for libthreema
@@ -102,7 +116,7 @@ afterEvaluate {
             }
 
             val processBuilder = ProcessBuilder(
-                "cargo",
+                cargoBin,
                 "run",
                 "-p",
                 "uniffi-bindgen",
@@ -115,6 +129,7 @@ afterEvaluate {
                 bindingsDirectory,
                 "--no-format",
             )
+            processBuilder.environment()["PATH"] = extraPath
             processBuilder.directory(file("${project.projectDir}/libthreema"))
             processBuilder.start().waitFor()
         }
@@ -152,6 +167,7 @@ publishing {
 tasks.register<Exec>("compileProto") {
     group = "build"
     description = "generate class bindings from protobuf files in the 'protocol/src' directory"
+    environment("PATH", "/opt/homebrew/bin:/usr/local/bin:${System.getProperty("user.home")}/.cargo/bin:" + (System.getenv("PATH") ?: ""))
     workingDir(project.projectDir)
     commandLine("./compile-proto.sh")
 }
@@ -159,8 +175,9 @@ tasks.register<Exec>("compileProto") {
 tasks.compileKotlin.dependsOn("compileProto")
 
 tasks.register<Exec>("libthreemaCleanUp") {
+    environment("PATH", "/opt/homebrew/bin:/usr/local/bin:${System.getProperty("user.home")}/.cargo/bin:" + (System.getenv("PATH") ?: ""))
     workingDir("${project.projectDir}/libthreema")
-    commandLine("cargo", "clean")
+    commandLine(findExecutable("cargo"), "clean")
 }
 
 tasks.clean.dependsOn("libthreemaCleanUp")

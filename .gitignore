@@ -5,6 +5,7 @@ gen
 *.iml
 .gradle
 app/build
+app/libs
 app/obj
 build
 local.properties
